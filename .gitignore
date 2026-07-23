@@ -6,3 +6,4 @@ bench/results/
 *.engine
 *.onnx
 datasets/
+VisDrone2019-DET/

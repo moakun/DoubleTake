@@ -30,6 +30,7 @@ import numpy as np
 IOU_MATCH = 0.5
 NMS_IOU = 0.5
 SMALL_AREA = 32 * 32
+MAX_DETS = 300  # COCO-style cap per image after merging, identical across curves
 FRACTIONS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.33, 0.50, 0.75, 1.0]
 RANDOM_SEEDS = 5
 PASS_SPARSITY = 0.90
@@ -241,14 +242,40 @@ def run_dataset(args) -> None:
         if (n + 1) % 25 == 0:
             print(f"  cached {n + 1}/{len(images)}")
 
-    # ---- gains, objectness, curves
+    if args.cache_only:
+        print("cache-only mode: done.")
+        return
+
+    # ---- precompute per-image state ONCE (reused across all curves)
+    records = []
+    for stem, c in per_image:
+        gt, ign = load_visdrone_gt(
+            Path(args.data) / "annotations" / f"{stem}.txt")
+        t1 = np.array(c["t1"]) if c["t1"] else np.zeros((0, 6))
+        grid = np.array(c["grid"])
+        tiles = [np.array(t) if t else np.zeros((0, 6)) for t in c["tiles"]]
+        gt_eval = gt[~ign]
+        t1_matched = match_gt(t1, gt_eval) if len(gt) else set()
+        gains = np.array([len(match_gt(td, gt_eval) - t1_matched)
+                          for td in tiles], float)
+        obj = np.zeros(len(grid))
+        if len(t1):
+            cx = (t1[:, 0] + t1[:, 2]) / 2
+            cy = (t1[:, 1] + t1[:, 3]) / 2
+            for ti, (ox, oy) in enumerate(grid):
+                m = ((cx >= ox) & (cx < ox + args.s_t)
+                     & (cy >= oy) & (cy < oy + args.s_t))
+                obj[ti] = t1[m, 4].sum()
+        records.append({"t1": t1, "tiles": tiles, "gains": gains,
+                        "obj": obj, "gt": gt, "ign": ign})
+    print(f"precomputed gains for {len(records)} images "
+          f"(mean |G|={np.mean([len(r['gains']) for r in records]):.1f}, "
+          f"zero-gain tiles="
+          f"{np.mean([np.mean(r['gains'] == 0) for r in records]):.1%})")
+
     curves = {p: {f: [] for f in FRACTIONS}
               for p in ("oracle", "objectness", "uniform", "random")}
     rngs = [np.random.default_rng(s) for s in range(RANDOM_SEEDS)]
-
-    gts = {}
-    for stem, c in per_image:
-        gts[stem] = load_visdrone_gt(Path(args.data) / "annotations" / f"{stem}.txt")
 
     for f in FRACTIONS:
         for policy in curves:
@@ -256,30 +283,15 @@ def run_dataset(args) -> None:
             per_seed = []
             for rng in seeds:
                 batch = []
-                for stem, c in per_image:
-                    gt, ign = gts[stem]
-                    t1 = np.array(c["t1"]) if c["t1"] else np.zeros((0, 6))
-                    grid = np.array(c["grid"])
-                    tiles = [np.array(t) if t else np.zeros((0, 6))
-                             for t in c["tiles"]]
-                    t1_matched = match_gt(t1, gt[~ign]) if len(gt) else set()
-                    gt_eval = gt[~ign]
-                    gains = np.array([
-                        len(match_gt(td, gt_eval) - t1_matched)
-                        for td in tiles], float)
-                    obj = np.zeros(len(grid))
-                    if len(t1):
-                        cx = (t1[:, 0] + t1[:, 2]) / 2
-                        cy = (t1[:, 1] + t1[:, 3]) / 2
-                        for ti, (ox, oy) in enumerate(grid):
-                            m = ((cx >= ox) & (cx < ox + args.s_t)
-                                 & (cy >= oy) & (cy < oy + args.s_t))
-                            obj[ti] = t1[m, 4].sum()
-                    k = int(round(f * len(grid)))
-                    sel = select_tiles(policy, k, gains, obj, rng)
-                    merged = np.vstack([t1] + [tiles[i] for i in sel]) \
-                        if len(sel) else t1
-                    batch.append((nms(merged), gt, ign))
+                for r in records:
+                    k = int(round(f * len(r["gains"])))
+                    sel = select_tiles(policy, k, r["gains"], r["obj"], rng)
+                    merged = np.vstack([r["t1"]] + [r["tiles"][i] for i in sel]) \
+                        if len(sel) else r["t1"]
+                    merged = nms(merged)
+                    if len(merged) > MAX_DETS:
+                        merged = merged[np.argsort(-merged[:, 4])[:MAX_DETS]]
+                    batch.append((merged, r["gt"], r["ign"]))
                 per_seed.append(ap_small(batch))
             curves[policy][f] = float(np.mean(per_seed))
         print(f"f={f:.2f}  " + "  ".join(
@@ -390,6 +402,8 @@ def main() -> None:
     ap.add_argument("--rho", type=float, default=0.2)
     ap.add_argument("--conf", type=float, default=0.01)
     ap.add_argument("--limit", type=int, default=0, help="debug: first N images")
+    ap.add_argument("--cache-only", action="store_true",
+                    help="run the GPU caching pass and exit (resumable)")
     ap.add_argument("--cache", default="bench/cache")
     ap.add_argument("--out", default="bench/results")
     args = ap.parse_args()
