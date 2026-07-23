@@ -1,0 +1,5 @@
+# torch/torchvision: install per your CUDA version first — https://pytorch.org
+numpy
+ultralytics>=8.3
+opencv-python
+matplotlib

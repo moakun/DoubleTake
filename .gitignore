@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+bench/cache/
+bench/results/
+*.pt
+*.engine
+*.onnx
+datasets/
